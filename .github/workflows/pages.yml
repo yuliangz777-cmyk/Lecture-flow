@@ -1,0 +1,49 @@
+name: Deploy the PWA to GitHub Pages
+
+# Manual for now. GitHub Pages needs a one-time switch-on that a workflow
+# token is not allowed to perform, and Pages on a private repository requires
+# a paid plan. Once the repository is public and
+#   Settings -> Pages -> Build and deployment -> Source: GitHub Actions
+# is set, run this workflow once from the Actions tab; then add
+#
+#   push:
+#     branches: [main]
+#
+# below to publish on every push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Frontend tests
+        run: npm test
+      - uses: actions/configure-pages@v5
+      - name: Package the PWA
+        # Only static/ is published; the FastAPI backend is for running the
+        # app locally and is deliberately not part of the site.
+        run: |
+          mkdir -p _site
+          rsync -a static/ _site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
