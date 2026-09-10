@@ -25,8 +25,8 @@ const API_BASE = new URL('./api/', document.baseURI).href;
 const WORKLET_URL = new URL('./capture-worklet.js', import.meta.url).href;
 
 const STORAGE_KEY = 'lectureflow.session.v2';
-const AUTO_SUMMARY_MS = 30000;
-const AUTO_SUMMARY_CHARS = 320;
+const AUTO_SUMMARY_MS = 15000;
+const AUTO_SUMMARY_CHARS = 180;
 
 const state = {
   settings: config.load(),
@@ -44,10 +44,38 @@ const state = {
   startedAt: null,
 };
 
+/**
+ * The transcript in two parts.
+ *
+ * `committed` is the real text. `interim` is what the recogniser currently
+ * believes it is hearing and has not settled on yet - it is rewritten on
+ * every update and replaced outright when the final result lands. The
+ * textarea shows both concatenated, so words appear as they are spoken
+ * instead of only after the speaker pauses.
+ */
+const live = { committed: '', interim: '' };
+
+const transcriptText = () => live.committed;
+
+function renderTranscript({ keepScroll = false } = {}) {
+  const atBottom = keepScroll
+    && el.transcript.scrollHeight - el.transcript.scrollTop - el.transcript.clientHeight < 80;
+  const separator = live.interim && live.committed ? ' ' : '';
+  el.transcript.value = live.committed + separator + live.interim;
+  if (!keepScroll || atBottom) el.transcript.scrollTop = el.transcript.scrollHeight;
+}
+
+function setInterim(text) {
+  const next = (text || '').trim();
+  if (next === live.interim) return;
+  live.interim = next;
+  renderTranscript({ keepScroll: true });
+}
+
 const audio = { stream: null, context: null, node: null, sink: null, segmenter: null, watchdog: null };
 const speech = { recognition: null };
 const wake = { lock: null };
-const uploads = { queue: [], inflight: 0, max: 2, seq: 0, nextEmit: 0, ready: new Map() };
+const uploads = { queue: [], inflight: 0, max: 3, seq: 0, nextEmit: 0, ready: new Map() };
 
 /* ---------------------------------------------------------------- UI ---- */
 
@@ -82,7 +110,7 @@ function setListening(active, info) {
 }
 
 function updateCount() {
-  el.chars.textContent = el.transcript.value.length;
+  el.chars.textContent = live.committed.length;
   persist();
 }
 
@@ -95,23 +123,31 @@ function updateBacklog() {
 
 /* --------------------------------------------------------- persistence -- */
 
+function writeSession() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      transcript: live.committed, notes: state.notes,
+      seconds: state.seconds, savedAt: Date.now(),
+    }));
+  } catch { /* private mode or quota: the session simply is not restorable */ }
+}
+
 let persistTimer = null;
-function persist() {
+
+/** Save the session. Writes are debounced, except when the page is going
+ *  away: a scheduled write never runs once the tab is gone, and swiping a
+ *  PWA away on iOS is the single most likely way to end a lecture. */
+function persist({ immediate = false } = {}) {
   clearTimeout(persistTimer);
-  persistTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({
-        transcript: el.transcript.value, notes: state.notes,
-        seconds: state.seconds, savedAt: Date.now(),
-      }));
-    } catch { /* private mode or quota: the session simply is not restorable */ }
-  }, 400);
+  persistTimer = null;
+  if (immediate) { writeSession(); return; }
+  persistTimer = setTimeout(writeSession, 400);
 }
 
 function restore() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-    if (saved.transcript) el.transcript.value = saved.transcript;
+    if (saved.transcript) { live.committed = saved.transcript; renderTranscript(); }
     if (saved.notes) { state.notes = saved.notes; renderNotes(saved.notes); }
     if (saved.seconds) {
       state.seconds = saved.seconds;
@@ -172,7 +208,7 @@ async function transcribeWithRetry(job) {
   let delay = 600;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      return await state.transcriber.transcribe(job.buffer, el.transcript.value);
+      return await state.transcriber.transcribe(job.buffer, transcriptText());
     } catch (error) {
       if (attempt === 2) throw error;
       await new Promise((resolve) => setTimeout(resolve, delay));
@@ -224,10 +260,9 @@ function enqueueSegment(samples) {
 function appendTranscript(text) {
   const cleaned = cleanChunk(text);
   if (!cleaned) return;
-  const atBottom =
-    el.transcript.scrollHeight - el.transcript.scrollTop - el.transcript.clientHeight < 60;
-  el.transcript.value = joinTranscript(el.transcript.value, cleaned);
-  if (atBottom) el.transcript.scrollTop = el.transcript.scrollHeight;
+  live.committed = joinTranscript(live.committed, cleaned);
+  live.interim = '';
+  renderTranscript({ keepScroll: true });
   updateCount();
   if (state.listening) setInfo('即時轉錄中');
   maybeAutoSummarize();
@@ -339,11 +374,21 @@ function buildRecognition() {
       const piece = event.results[i][0].transcript;
       if (event.results[i].isFinal) final += `${piece} `; else interim += piece;
     }
-    if (final) appendTranscript(final);
-    setInfo(interim ? `辨識中：${escapeHtml(interim)}` : '瀏覽器即時辨識中');
+    // Show the unsettled text in the transcript straight away. Waiting for
+    // isFinal means nothing moves until the speaker pauses, which can be
+    // several seconds - long enough to look broken.
+    if (final) appendTranscript(final); else setInterim(interim);
+    setInfo(interim ? '辨識中…' : '瀏覽器即時辨識中');
   };
   recognition.onend = () => {
-    // Safari and Chrome both end the session periodically; restart it.
+    // Safari and Chrome both end the session periodically; restart it. Commit
+    // whatever was still provisional so a dropped session cannot strand a
+    // half-finished phrase on screen forever.
+    if (live.interim) {
+      const stranded = live.interim;
+      live.interim = '';
+      appendTranscript(stranded);
+    }
     if (state.listening) { try { recognition.start(); } catch { /* already running */ } }
   };
   recognition.onerror = (event) => {
@@ -384,10 +429,15 @@ async function start() {
 function stop() {
   if (!state.listening && !audio.stream) return;
   setListening(false, '已停止');
+  if (live.interim) {
+    const stranded = live.interim;
+    live.interim = '';
+    appendTranscript(stranded);
+  }
   teardownCapture();
   try { speech.recognition?.stop(); } catch { /* ignore */ }
   releaseWakeLock();
-  persist();
+  persist({ immediate: true });
 }
 
 /* ----------------------------------------------------------- notes ------ */
@@ -413,14 +463,14 @@ function renderNotes(notes) {
 }
 
 function maybeAutoSummarize() {
-  const text = el.transcript.value;
+  const text = transcriptText();
   const grown = text.length - state.lastSummaryText.length >= AUTO_SUMMARY_CHARS;
   const stale = Date.now() - state.lastSummaryAt >= AUTO_SUMMARY_MS;
   if (text.length > 120 && grown && stale) summarize(false);
 }
 
 async function summarize(explicit = true) {
-  const text = el.transcript.value.trim();
+  const text = transcriptText().trim();
   if (!text) { if (explicit) toast('目前沒有逐字稿'); return; }
   if (state.summarizing) { if (explicit) toast('正在整理中'); return; }
 
@@ -456,7 +506,7 @@ function addMessage(who, text, mine = false) {
 
 async function ask() {
   const question = el.question.value.trim();
-  const transcript = el.transcript.value.trim();
+  const transcript = transcriptText().trim();
   if (!question) return;
   if (!transcript) { toast('目前沒有逐字稿'); return; }
 
@@ -478,8 +528,8 @@ async function ask() {
 /* -------------------------------------------------------------- export -- */
 
 function exportNotes() {
-  const notes = state.notes || localSummary(el.transcript.value);
-  const markdown = notesToMarkdown(notes, el.transcript.value, {
+  const notes = state.notes || localSummary(transcriptText());
+  const markdown = notesToMarkdown(notes, transcriptText(), {
     date: (state.startedAt || new Date()).toLocaleString(),
     duration: formatClock(state.seconds),
   });
@@ -494,6 +544,8 @@ function exportNotes() {
 function clearSession() {
   stop();
   if (!confirm('清空逐字稿與筆記？此動作無法復原。')) return;
+  live.committed = '';
+  live.interim = '';
   el.transcript.value = '';
   state.notes = null;
   state.lastSummaryText = '';
@@ -558,7 +610,12 @@ el.clearKeys.onclick = () => {
   toast('已清除這台裝置上的金鑰。');
 };
 
-el.transcript.addEventListener('input', updateCount);
+el.transcript.addEventListener('input', () => {
+  // The user is editing; whatever is in the box is now the committed text.
+  live.committed = el.transcript.value;
+  live.interim = '';
+  updateCount();
+});
 el.question.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); ask(); }
 });
@@ -577,7 +634,11 @@ document.querySelectorAll('.tab').forEach((tab) => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.listening && !wake.lock) requestWakeLock();
 });
-window.addEventListener('pagehide', () => { persist(); stop(); });
+window.addEventListener('pagehide', () => { stop(); persist({ immediate: true }); });
+document.addEventListener('visibilitychange', () => {
+  // iOS does not always deliver pagehide; hidden is the reliable last call.
+  if (document.visibilityState === 'hidden') persist({ immediate: true });
+});
 
 async function init() {
   setListening(false, '等待開始');

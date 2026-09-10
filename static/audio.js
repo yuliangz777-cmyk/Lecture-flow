@@ -82,10 +82,14 @@ export function encodeWav(samples, sampleRate = TARGET_RATE) {
 export const SEGMENTER_DEFAULTS = {
   sampleRate: TARGET_RATE,
   frameMs: 20,
-  minSegmentMs: 1500,
-  maxSegmentMs: 14000,
-  silenceMs: 700,
-  padMs: 300,
+  // Latency budget. A segment cannot become text until it closes, so these
+  // set how long the screen sits still while someone is talking. Shorter
+  // segments feel live but give the model less context per request, so the
+  // recent transcript is sent along as a priming hint to compensate.
+  minSegmentMs: 900,
+  maxSegmentMs: 7000,
+  silenceMs: 500,
+  padMs: 250,
   overlapMs: 400,
   floorDb: -70,
   marginDb: 9,

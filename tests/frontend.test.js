@@ -6,7 +6,7 @@ import {
   localAnswer, localSummary, normalizeKey, notesToMarkdown,
 } from '../static/text.js';
 import {
-  encodeWav, floatToPcm16, resampleTo, rms, dbfs, Segmenter, TARGET_RATE,
+  encodeWav, floatToPcm16, resampleTo, rms, dbfs, Segmenter, SEGMENTER_DEFAULTS, TARGET_RATE,
 } from '../static/audio.js';
 
 /* ------------------------------------------------------------------ text */
@@ -178,6 +178,7 @@ test('segmenter never uploads pure silence and stays bounded', () => {
 });
 
 test('segmenter force-cuts a speaker who never pauses, with overlap', () => {
+  const { maxSegmentMs, frameMs } = SEGMENTER_DEFAULTS;
   const segmenter = new Segmenter();
   const segments = segmenter.push(tone(30));
 
@@ -185,11 +186,43 @@ test('segmenter force-cuts a speaker who never pauses, with overlap', () => {
   assert.ok(segments.every((s) => s.reason === 'maxlen'));
   for (const segment of segments) {
     const durationMs = (segment.samples.length / TARGET_RATE) * 1000;
-    assert.ok(durationMs <= 14100, `segment ran to ${durationMs}ms`);
+    // Derived from the configured budget, not a hard-coded number, so
+    // retuning latency does not silently invalidate this check.
+    assert.ok(durationMs <= maxSegmentMs + frameMs, `segment ran to ${durationMs}ms`);
   }
   // The carried overlap means the pieces sum to more than the input duration.
   const total = segments.reduce((sum, s) => sum + s.samples.length, 0);
-  assert.ok(total > seconds(13) * segments.length * 0.9);
+  const floor = (maxSegmentMs / 1000) * TARGET_RATE * segments.length * 0.9;
+  assert.ok(total > floor, `pieces summed to ${total}, expected more than ${floor}`);
+});
+
+test('a non-stop speaker still sees text within the latency budget', () => {
+  // The product promise: nothing on screen should sit still for longer than
+  // one segment, even if the speaker never pauses. This pins that budget.
+  const { maxSegmentMs } = SEGMENTER_DEFAULTS;
+  assert.ok(maxSegmentMs <= 8000, `worst-case wait is ${maxSegmentMs}ms`);
+
+  const segmenter = new Segmenter();
+  const segments = segmenter.push(tone(20));
+  assert.ok(segments.length >= 2, 'expected repeated force-cuts inside 20s');
+
+  const gapMs = (20000 - maxSegmentMs) / segments.length;
+  assert.ok(gapMs <= maxSegmentMs, `segments arrived ${gapMs}ms apart`);
+});
+
+test('a pausing speaker sees text shortly after each phrase', () => {
+  const { silenceMs, minSegmentMs, padMs } = SEGMENTER_DEFAULTS;
+  assert.ok(silenceMs <= 600, `waits ${silenceMs}ms of silence before cutting`);
+  assert.ok(minSegmentMs <= 1200, `holds back until ${minSegmentMs}ms of audio`);
+
+  const segmenter = new Segmenter();
+  // 1.4s of speech then a pause: long enough to clear minSegmentMs.
+  const segments = segmenter.push(concat(silence(0.4), tone(1.4), silence(0.9)));
+  assert.equal(segments.length, 1, 'a short phrase should still close on its pause');
+  assert.equal(segments[0].reason, 'pause');
+
+  const durationMs = (segments[0].samples.length / TARGET_RATE) * 1000;
+  assert.ok(durationMs < 1400 + padMs * 2 + 200, `segment carried ${durationMs}ms`);
 });
 
 test('segmenter accepts arbitrary block sizes across calls', () => {
